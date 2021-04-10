@@ -1,7 +1,7 @@
 absl-py==0.9.0
 astor==0.8.1
 atari-py==0.2.6
-# -e git+https://github.com/openai/baselines.git@ea25b9e8b234e6ee1bca43083f8f3cf974143998#egg=baselines
+git+https://github.com/openai/baselines.git@ea25b9e8b234e6ee1bca43083f8f3cf974143998#egg=baselines
 box2d-py==2.3.8
 cffi==1.14.0
 click==7.1.2
