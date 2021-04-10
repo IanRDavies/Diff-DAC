@@ -50,7 +50,8 @@ We also implement wrappers to enable variants of standard MuJoCo environments in
 
 
 ## Acknowledgements
-Gossip-based Actor-Learner Architectures (GALA)
+**Gossip-based Actor-Learner Architectures (GALA)**
+
 This repo was built upon the [implementation of GALA](https://github.com/facebookresearch/gala)
 used for the experiments reported in
 > Mido Assran, Joshua Romoff, Nicolas Ballas, Joelle Pineau, and Mike Rabbat, "Gossip-based actor learner architectures for deep reinforcement learning," *Advances in Neural Information Processing Systems (NeurIPS)* 2019. [arxiv version](https://arxiv.org/abs/1906.04585)
