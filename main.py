@@ -5,52 +5,60 @@
 # LICENSE file in the root directory of this source tree.
 #
 import os
-import glob
 import pprint as pp
-import time
 from collections import deque
+from copy import deepcopy
 
-import numpy as np
 import torch
 import torch.multiprocessing as mp
 
-from gala.arguments import get_args
-from gala.storage import RolloutStorage
-from gala.model import Policy
-from gala.gpu_gossip_buffer import GossipBuffer
-from gala.gala_a2c import GALA_A2C
-from gala.graph_manager import FullyConnectedGraph as Graph
+from pyvirtualdisplay import Display
+
+from diffdac.arguments import get_args
+from diffdac.storage import RolloutStorage
+from diffdac.model import Policy
+from diffdac.gpu_gossip_buffer import GossipBuffer
+from diffdac.diffdac_a2c import DiffDAC_A2C
+from diffdac.graph_manager import SymmetricConnectionGraph
+from diffdac.utils import get_args_string, cleanup_log_dir, cleanup_save_dir
 
 
-def actor_learner(args, rank, barrier, device, gossip_buffer):
+def actor_learner(args, rank, barrier, device, gossip_buffer, env_group_spec=None):
     """ Single Actor-Learner Process """
+    if args.server_mode:
+        Display(visible=0, size=(1400, 900)).start()
 
+    # Set random seeds
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-
-    torch.cuda.set_device(device)
-    if args.cuda and torch.cuda.is_available() and args.cuda_deterministic:
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
+    if args.cuda and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.set_device(device)
+        if args.cuda_deterministic:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
 
     # (Hack) Import here to ensure OpenAI-gym envs only run on the CPUs
     # corresponding to the processes' affinity
-    from gala import utils
-    from gala.envs import make_vec_envs
+    from diffdac.envs import make_vec_envs
     # Make envs
     envs = make_vec_envs(args.env_name, args.seed, args.num_procs_per_learner,
-                         args.gamma, args.log_dir, device, False,
-                         rank=rank)
+                         args.gamma, args.log_dir, device, False, rank=rank,
+                         env_group_spec=env_group_spec, signature=f'Agent-Rank-{rank}')
+
+    # Policy Setup
+    base_kwargs = {'recurrent': args.recurrent_policy}
+    base_kwargs['init_repeats'] = rank if args.separate_intialisation else 1
 
     # Initialize actor_critic
     actor_critic = Policy(
-        envs.observation_space.shape,
-        envs.action_space,
-        base_kwargs={'recurrent': args.recurrent_policy})
+        env_name=args.env_name,
+        obs_shape=envs.observation_space.shape,
+        action_space=envs.action_space,
+        base_kwargs=base_kwargs)
     actor_critic.to(device)
 
     # Initialize agent
-    agent = GALA_A2C(
+    agent = DiffDAC_A2C(
         actor_critic,
         args.value_loss_coef,
         args.entropy_coef,
@@ -59,7 +67,8 @@ def actor_learner(args, rank, barrier, device, gossip_buffer):
         alpha=args.alpha,
         max_grad_norm=args.max_grad_norm,
         rank=rank,
-        gossip_buffer=gossip_buffer
+        gossip_buffer=gossip_buffer,
+        link_drop_prob=args.link_drop_proportion
     )
 
     rollouts = RolloutStorage(args.num_steps_per_update,
@@ -77,106 +86,88 @@ def actor_learner(args, rank, barrier, device, gossip_buffer):
     print('%s: barrier passed' % rank)
 
     # Start training
-    start = time.time()
+
+    # Calculate training intervals in terms of parameter updates rather than environment steps.
     num_updates = int(args.num_env_steps) // (
-        args.num_steps_per_update
-        * args.num_procs_per_learner
-        * args.num_learners)
+        args.num_steps_per_update * args.num_procs_per_learner * args.num_learners
+    )
     save_interval = int(args.save_interval) // (
-        args.num_steps_per_update
-        * args.num_procs_per_learner
-        * args.num_learners)
+            args.num_steps_per_update * args.num_procs_per_learner * args.num_learners
+    )
 
     for j in range(num_updates):
-
-        # Decrease learning rate linearly
-        if args.use_linear_lr_decay:
-            utils.update_linear_schedule(
-                agent.optimizer, j, num_updates, args.lr)
-        # --/
+        # Make sure we save parameters close to the end of training even if agents are out of sync.
+        to_go = num_updates - j
+        if to_go < args.sync_freq:
+            torch.save(
+                [actor_critic.state_dict()],
+                os.path.join(args.save_dir, f'params_{to_go}_to_go_agent_{rank}.pt')
+            )
 
         # Step through environment
-        # --
         for step in range(args.num_steps_per_update):
             # Sample actions
             with torch.no_grad():
                 value, action, action_log_prob, recurrent_hidden_states = actor_critic.act(
                     rollouts.obs[step], rollouts.recurrent_hidden_states[step],
-                    rollouts.masks[step])
-            # Obser reward and next obs
+                    rollouts.masks[step]
+                )
+
+            # Observe reward and next obs
             obs, reward, done, infos = envs.step(action)
             for info in infos:
                 if 'episode' in info.keys():
                     episode_rewards.append(info['episode']['r'])
+
             # If done then clean the history of observations.
-            masks = torch.FloatTensor(
-                [[0.0] if done_ else [1.0] for done_ in done])
+            masks = torch.FloatTensor([[0.0] if done_ else [1.0] for done_ in done])
             bad_masks = torch.FloatTensor(
-                [[0.0] if 'bad_transition' in info.keys() else [1.0]
-                 for info in infos])
+                [[0.0] if 'bad_transition' in info.keys() else [1.0] for info in infos]
+            )
             rollouts.insert(obs, recurrent_hidden_states, action,
                             action_log_prob, value, reward, masks, bad_masks)
         # --/
 
         # Update parameters
-        # --
         with torch.no_grad():
             next_value = actor_critic.get_value(
                 rollouts.obs[-1], rollouts.recurrent_hidden_states[-1],
-                rollouts.masks[-1]).detach()
-        rollouts.compute_returns(next_value, args.use_gae, args.gamma,
-                                 args.gae_lambda, args.use_proper_time_limits)
-        value_loss, action_loss, dist_entropy = agent.update(rollouts)
+                rollouts.masks[-1]
+            ).detach()
+        rollouts.compute_returns(
+            next_value, args.use_gae, args.gamma, args.gae_lambda, args.use_proper_time_limits
+        )
+        agent.update(rollouts)
         rollouts.after_update()
         # --/
 
         # Save every "save_interval" local environment steps (or last update)
-        if (j % save_interval == 0
-                or j == num_updates - 1) and args.save_dir != '':
-            torch.save([
-                actor_critic,
-                getattr(utils.get_vec_normalize(envs), 'ob_rms', None)
-            ], os.path.join(args.save_dir,
-                            '%s.%.3d.pt' % (rank, j // save_interval)))
+        if (j % save_interval == 0 or j == num_updates - 1) and args.save_dir != '':
+            torch.save(
+                [actor_critic.state_dict()],
+                os.path.join(args.save_dir, '%s.%.3d.pt' % (rank, j // save_interval)))
         # --/
 
-        # Log every "log_interval" local environment steps
-        if j % args.log_interval == 0 and len(episode_rewards) > 1:
-            num_steps = (j + 1) * args.num_procs_per_learner \
-                * args.num_steps_per_update
-            end = time.time()
-            print(('{}: Updates {}, num timesteps {}, FPS {} ' +
-                   '\n {}: Last {} training episodes: ' +
-                   'mean/median reward {:.1f}/{:.1f}, ' +
-                   'min/max reward {:.1f}/{:.1f}\n').
-                  format(rank, j, num_steps,
-                         int(num_steps / (end - start)), rank,
-                         len(episode_rewards),
-                         np.mean(episode_rewards),
-                         np.median(episode_rewards),
-                         np.min(episode_rewards),
-                         np.max(episode_rewards),
-                         dist_entropy, value_loss, action_loss
-                         ))
-        # --/
+    # Save agent parameters at the end of training.
+    torch.save([actor_critic.state_dict()], os.path.join(args.save_dir, f'final_params_{rank}.pt'))
 
 
 def make_gossip_buffer(args, mng, device):
-
+    """ Builds a gossip buffer shared by all agents for the purpose of message passing """
     # Make local-gossip-buffer
     if args.num_learners > 1:
         # Make Topology
         topology = []
         for rank in range(args.num_learners):
-            graph = Graph(rank, args.num_learners,
-                          peers_per_itr=args.num_peers)
+            graph = SymmetricConnectionGraph(args.adjacency_matrix, rank)
             topology.append(graph)
 
         # Initialize "actor_critic-shaped" parameter-buffer
         actor_critic = Policy(
-            (4, 84, 84),
-            base_kwargs={'recurrent': args.recurrent_policy},
-            env_name=args.env_name)
+                env_name=args.env_name,
+                base_kwargs={'recurrent': args.recurrent_policy}
+            )
+        
         actor_critic.to(device)
 
         # Keep track of local iterations since learner's last sync
@@ -186,7 +177,8 @@ def make_gossip_buffer(args, mng, device):
         # Used to signal between processes that message was read
         read_events = mng.list([
             mng.list([mng.Event() for _ in range(args.num_learners)])
-            for _ in range(args.num_learners)])
+            for _ in range(args.num_learners)
+        ])
         # Used to signal between processes that message was written
         write_events = mng.list([
             mng.list([mng.Event() for _ in range(args.num_learners)])
@@ -195,10 +187,12 @@ def make_gossip_buffer(args, mng, device):
         # Need to maintain a reference to all objects in main processes
         _references = [topology, actor_critic, buffer_locks,
                        read_events, write_events, sync_list]
+        
         gossip_buffer = GossipBuffer(topology, actor_critic, buffer_locks,
-                                     read_events, write_events, sync_list,
-                                     sync_freq=args.sync_freq)
+                                        read_events, write_events, sync_list,
+                                        sync_freq=args.sync_freq)
     else:
+        # Only one agent so no gossip buffer needed
         _references = None
         gossip_buffer = None
 
@@ -206,26 +200,23 @@ def make_gossip_buffer(args, mng, device):
 
 
 def train(args):
+    """ The main function which sets up and trains agents. """
     pp.pprint(args)
 
     proc_manager = mp.Manager()
     barrier = proc_manager.Barrier(args.num_learners)
 
-    # Shared-gossip-buffer on GPU-0
+    # Shared-gossip-buffer on GPU-0 or CPU if no cuda.
     device = torch.device('cuda:%s' % 0 if args.cuda else 'cpu')
-    shared_gossip_buffer, _references = make_gossip_buffer(
-        args, proc_manager, device)
+    shared_gossip_buffer, _references = make_gossip_buffer(args, proc_manager, device)
 
-    # Make actor-learner processes
+    # Make actor-learner processes (one per learner)
     proc_list = []
     for rank in range(args.num_learners):
 
-        # Uncomment these lines to use 2 GPUs
-        # gpu_id = int(rank % 2)  # Even-rank agents on gpu-0, odd-rank on gpu-1
-        # device = torch.device('cuda:%s' % gpu_id if args.cuda else 'cpu')
         proc = mp.Process(
             target=actor_learner,
-            args=(args, rank, barrier, device, shared_gossip_buffer),
+            args=(args, rank, barrier, device, shared_gossip_buffer, args.env_group_spec),
             daemon=False
         )
         proc.start()
@@ -243,30 +234,21 @@ def train(args):
 
 
 if __name__ == "__main__":
+    # Set up
     mp.set_start_method('forkserver')
-    args = get_args()
     torch.set_num_threads(1)
+    args = get_args()
+
+    if args.server_mode:
+        # In cases where the environments do not run without some screen.
+        Display(visible=0, size=(1400, 900)).start()
 
     # Make/clean save & log directories
-    # --
-    def remove_files(files):
-        for f in files:
-            try:
-                os.remove(f)
-            except Exception:
-                pass
-    try:
-        os.makedirs(args.log_dir)
-    except OSError as e:
-        print(e)
-        files = glob.glob(os.path.join(args.log_dir, '*.monitor.csv'))
-        remove_files(files)
-    try:
-        os.makedirs(args.save_dir)
-    except OSError as e:
-        print(e)
-        files = glob.glob(os.path.join(args.save_dir, '*.pt'))
-        remove_files(files)
-    # --/
+    cleanup_log_dir(args.log_dir)
+    cleanup_save_dir(args.save_dir)
+    # Save run parameters for posterity
+    with open(os.path.join(args.log_dir, 'params.txt'), 'w') as f:
+        f.write(get_args_string(args))
 
     train(args)
+    print('TRAINING COMPLETE')

@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 
 
-# Necessary for my KFAC implementation.
+# Necessary for KFAC implementation.
 class AddBias(nn.Module):
     def __init__(self, bias):
         super(AddBias, self).__init__()
@@ -43,8 +43,11 @@ class AddBias(nn.Module):
         return x + bias
 
 
-def init(module, weight_init, bias_init, gain=1):
-    weight_init(module.weight.data, gain=gain)
+def init(module, weight_init, bias_init, gain=1, repeats=1):
+    """ Initialise variables for a layer of an MLP. """
+    for _ in range(repeats):
+        # A very naive way of initialising to different values without access to the seed.
+        weight_init(module.weight.data, gain=gain)
     bias_init(module.bias.data)
     return module
 
@@ -95,6 +98,7 @@ FixedBernoulli.mode = lambda self: torch.gt(self.probs, 0.5).float()
 
 
 class Categorical(nn.Module):
+    """ A multinomial distribution with a linear layer between inputs and logits. """
     def __init__(self, num_inputs, num_outputs):
         super(Categorical, self).__init__()
 
@@ -102,7 +106,8 @@ class Categorical(nn.Module):
             m,
             nn.init.orthogonal_,
             lambda x: nn.init.constant_(x, 0),
-            gain=0.01)
+            gain=0.01
+        )
 
         self.linear = init_(nn.Linear(num_inputs, num_outputs))
 
@@ -112,6 +117,10 @@ class Categorical(nn.Module):
 
 
 class DiagGaussian(nn.Module):
+    """
+    A Gaussian distribution with a linear layer between inputs and mean value.
+    The covariance matrix is diagonal.
+    """
     def __init__(self, num_inputs, num_outputs):
         super(DiagGaussian, self).__init__()
 
@@ -124,7 +133,7 @@ class DiagGaussian(nn.Module):
     def forward(self, x):
         action_mean = self.fc_mean(x)
 
-        #  An ugly hack for my KFAC implementation.
+        # An ugly hack for to implement KFAC.
         zeros = torch.zeros(action_mean.size())
         if x.is_cuda:
             zeros = zeros.cuda()
@@ -134,6 +143,7 @@ class DiagGaussian(nn.Module):
 
 
 class Bernoulli(nn.Module):
+    """ A Bernoulli distribution with a linear layer between inputs and logit. """
     def __init__(self, num_inputs, num_outputs):
         super(Bernoulli, self).__init__()
 

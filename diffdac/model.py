@@ -29,46 +29,81 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from gala.distributions import Bernoulli, Categorical, DiagGaussian
+from diffdac.distributions import Bernoulli, Categorical, DiagGaussian
 
 
-def init(module, weight_init, bias_init, gain=1):
-    weight_init(module.weight.data, gain=gain)
+def init(module, weight_init, bias_init, gain=1, repeats=1):
+    """ Iniitalise parameters for a layer of an MLP """
+    for _ in range(repeats):
+        # A very naive way of initialising to different values without access to the seed.
+        weight_init(module.weight.data, gain=gain)
     bias_init(module.bias.data)
     return module
 
 
 class Flatten(nn.Module):
+    """ Flattens a parameter tensor. """
     def forward(self, x):
         return x.view(x.size(0), -1)
 
 
 class Policy(nn.Module):
-    def __init__(self, obs_shape, action_space=None, base=None, base_kwargs=None, env_name=None):
+    def __init__(self, env_name, obs_shape=None, action_space=None, base=None, base_kwargs=None):
         super(Policy, self).__init__()
+        # Set up policy network and value function
         if base_kwargs is None:
             base_kwargs = {}
+        # annoying work around to get the observation shape as the environment is not passed to the
+        # policy init.
+        if obs_shape is None:
+            if 'Hopper-v2' in env_name:
+                obs_shape = (11,)
+            elif 'HalfCheetah-v2' in env_name:
+                obs_shape = (17,)
+            elif 'Acrobot' in env_name:
+                obs_shape = (6,)
+            else:
+                obs_shapes = {
+                    'BipedalWalker-v2': (24,),
+                    'BipedalWalkerHardcore-v2': (24,),
+                    'LunarLander-v2': (8,),
+                    'CartPole-v1': (4,),
+                    'MountainCar-v0': (2,)
+                }
+                obs_shape = obs_shapes[env_name]
         if base is None:
             if len(obs_shape) == 3:
+                # Observations are RGB images
                 base = CNNBase
             elif len(obs_shape) == 1:
+                # Observations are features.
                 base = MLPBase
             else:
                 raise NotImplementedError
 
+        # Policy network and value function share the same architecture and are both set up using
+        # the `base` class.
         self.base = base(obs_shape[0], **base_kwargs)
 
+        # Set up action distribution
+        # (with the workaround for the lack of access to the real environment at this stage)
         if action_space is None:
-            game = env_name[:env_name.find('NoFrameskip')]
-            num_actions = {
-                'BeamRider': 9,
-                'Breakout': 4,
-                'Pong': 6,
-                'Qbert': 6,
-                'Seaquest': 18,
-                'SpaceInvaders': 6,
-            }
-            num_outputs = num_actions[game]
+            game = env_name.replace('NoFrameskip', '')
+            if 'Hopper-v2' in env_name:
+                num_outputs = 3
+            elif 'HalfCheetah-v2' in env_name:
+                num_outputs = 6
+            elif 'Acrobot' in env_name:
+                num_outputs = 3
+            else:
+                num_actions = {
+                    'MountainCar-v0': 3,
+                    'CartPole-v1': 2,
+                    'BipedalWalker-v2': 4,
+                    'BipedalWalkerHardcore-v2': 4,
+                    'LunarLander-v2': 4
+                }
+                num_outputs = num_actions[game]
             self.dist = Categorical(self.base.output_size, num_outputs)
         elif action_space.__class__.__name__ == "Discrete":
             num_outputs = action_space.n
@@ -95,6 +130,7 @@ class Policy(nn.Module):
         raise NotImplementedError
 
     def act(self, inputs, rnn_hxs, masks, deterministic=False):
+        """ Maps observations to actions """
         value, actor_features, rnn_hxs = self.base(inputs, rnn_hxs, masks)
         dist = self.dist(actor_features)
 
@@ -104,15 +140,16 @@ class Policy(nn.Module):
             action = dist.sample()
 
         action_log_probs = dist.log_probs(action)
-        dist_entropy = dist.entropy().mean()
 
         return value, action, action_log_probs, rnn_hxs
 
     def get_value(self, inputs, rnn_hxs, masks):
+        """ Attain the estimated (by the value function) value for a given state. """
         value, _, _ = self.base(inputs, rnn_hxs, masks)
         return value
 
     def evaluate_actions(self, inputs, rnn_hxs, masks, action):
+        """ Provides values and action (log) probabilities for all provided observations. """
         value, actor_features, rnn_hxs = self.base(inputs, rnn_hxs, masks)
         dist = self.dist(actor_features)
 
@@ -123,6 +160,7 @@ class Policy(nn.Module):
 
 
 class NNBase(nn.Module):
+    """ Base neural network class for value and policy networks. """
     def __init__(self, recurrent, recurrent_input_size, hidden_size):
         super(NNBase, self).__init__()
 
@@ -152,6 +190,7 @@ class NNBase(nn.Module):
         return self._hidden_size
 
     def _forward_gru(self, x, hxs, masks):
+        """Forward pass through the gated recurrent network """
         if x.size(0) == hxs.size(0):
             x, hxs = self.gru(x.unsqueeze(0), (hxs * masks).unsqueeze(0))
             x = x.squeeze(0)
@@ -169,11 +208,11 @@ class NNBase(nn.Module):
 
             # Let's figure out which steps in the sequence have a zero for any agent
             # We will always assume t=0 has a zero in it as that makes the logic cleaner
-            has_zeros = ((masks[1:] == 0.0) \
-                            .any(dim=-1)
-                            .nonzero()
-                            .squeeze()
-                            .cpu())
+            has_zeros = ((masks[1:] == 0.0)
+                         .any(dim=-1)
+                         .nonzero()
+                         .squeeze()
+                         .cpu())
 
             # +1 to correct the masks[1:]
             if has_zeros.dim() == 0:
@@ -208,45 +247,16 @@ class NNBase(nn.Module):
 
         return x, hxs
 
-
-class CNNBase(NNBase):
-    def __init__(self, num_inputs, recurrent=False, hidden_size=512):
-        super(CNNBase, self).__init__(recurrent, hidden_size, hidden_size)
-
-        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
-                               constant_(x, 0), nn.init.calculate_gain('relu'))
-
-        self.main = nn.Sequential(
-            init_(nn.Conv2d(num_inputs, 32, 8, stride=4)), nn.ReLU(),
-            init_(nn.Conv2d(32, 64, 4, stride=2)), nn.ReLU(),
-            init_(nn.Conv2d(64, 32, 3, stride=1)), nn.ReLU(), Flatten(),
-            init_(nn.Linear(32 * 7 * 7, hidden_size)), nn.ReLU())
-
-        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
-                               constant_(x, 0))
-
-        self.critic_linear = init_(nn.Linear(hidden_size, 1))
-
-        self.train()
-
-    def forward(self, inputs, rnn_hxs, masks):
-        x = self.main(inputs / 255.0)
-
-        if self.is_recurrent:
-            x, rnn_hxs = self._forward_gru(x, rnn_hxs, masks)
-
-        return self.critic_linear(x), x, rnn_hxs
-
-
 class MLPBase(NNBase):
-    def __init__(self, num_inputs, recurrent=False, hidden_size=64):
+    """ Base neural network class for value and policy networks where observations are features. """
+    def __init__(self, num_inputs, recurrent=False, hidden_size=64, init_repeats=1):
         super(MLPBase, self).__init__(recurrent, num_inputs, hidden_size)
 
         if recurrent:
             num_inputs = hidden_size
 
         init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
-                               constant_(x, 0), np.sqrt(2))
+                               constant_(x, 0), np.sqrt(2), repeats=init_repeats)
 
         self.actor = nn.Sequential(
             init_(nn.Linear(num_inputs, hidden_size)), nn.Tanh(),

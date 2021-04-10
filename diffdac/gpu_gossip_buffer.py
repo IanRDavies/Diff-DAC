@@ -13,11 +13,11 @@ Gossip Buffer
     tensors to on one-another
 """
 
-import copy
 import torch
+from copy import deepcopy
 
 
-class GossipBuffer():
+class GossipBuffer:
 
     def __init__(self, topology, model, buffer_locks, read_events,
                  write_events, sync_list, sync_freq=0):
@@ -35,7 +35,7 @@ class GossipBuffer():
         # [3] -> Lock for safe access of Msg-Tensor
         self.msg_buffer = []
         for rank in range(self.num_learners):
-            msg = copy.deepcopy(model)
+            msg = deepcopy(model)
             msg.share_memory()
             r_events = read_events[rank]
             w_events = write_events[rank]
@@ -50,7 +50,7 @@ class GossipBuffer():
 
     def write_message(self, rank, model, rotate=False):
         """
-        Write agent 'rank's 'model' to a local 'boradcast buffer' that will be
+        Write agent 'rank's 'model' to a local 'broadcast buffer' that will be
         read by the out-neighbours defined in 'self.topology'.
 
         :param rank: Agent's rank in multi-agent graph topology
@@ -90,15 +90,16 @@ class GossipBuffer():
 
             # Update broadcast-buffer with new message
             # -- flatten params and multiply by mixing-weight
-            num_peers = self.topology[rank].peers_per_itr
             with lock:
-                for bp, p in zip(broadcast_buffer.parameters(),
-                                 model.parameters()):
+                for bp, p in zip(broadcast_buffer.parameters(), model.parameters()):
                     bp.data.copy_(p)
-                    bp.data.div_(num_peers + 1)
+
                 # -- mark message as 'written'
-                out_peers, _ = self.topology[rank].get_peers(rotate)
-                torch.cuda.current_stream().synchronize()
+                out_peers, _ = self.topology[rank].get_peers()
+
+                # Allow debugging on CPU but code should be run with GPU
+                if torch.cuda.is_available():
+                    torch.cuda.current_stream().synchronize()
                 for peer in out_peers:
                     write_event_list[peer].set()
 
@@ -137,13 +138,14 @@ class GossipBuffer():
             # Not done writing, but staleness is still tolerable
             else:
                 self.sync_list[rank] += 1
-                print('%s: staleness %s' % (rank, self.sync_list[rank]))
+                if self.sync_list[rank] == self.sync_freq - 1:
+                    print('staleness approaching maximum')
+                    print('%s: staleness %s' % (rank, self.sync_list[rank]))
                 return
 
             # Lazy-mixing of local params
-            num_peers = self.topology[rank].peers_per_itr
-            for p in model.parameters():
-                p.data.div_(num_peers + 1)
+            # num_peers = self.topology[rank].peers_per_itr
+            num_peers = len(in_peers)
 
             # Aggregate received messages
             for peer in in_peers:
@@ -155,6 +157,12 @@ class GossipBuffer():
                     for p, bp in zip(model.parameters(),
                                      peer_msg.parameters()):
                         p.data.add_(bp.to(p.device, non_blocking=True))
-                    torch.cuda.current_stream().synchronize()
+
+                    # Allow debugging on CPU but code should be run with GPU
+                    if torch.cuda.is_available():
+                        torch.cuda.current_stream().synchronize()
                     # Mark message as 'read'
                     peer_buffer[1][rank].set()
+            # Average out parameters
+            for p in model.parameters():
+                p.data.div_(num_peers + 1)

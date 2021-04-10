@@ -24,20 +24,18 @@ SOFTWARE.
 Taken from https://github.com/ikostrikov/pytorch-a2c-ppo-acktr-gail
 and slightly modified.
 """
-import glob
-import logging
-import math
 import os
-import sys
+import glob
+from collections import OrderedDict
+from datetime import datetime
 
-import torch
 import torch.nn as nn
 
-from gala.envs import VecNormalize
+from diffdac.envs import VecNormalize
 
 
-# Get a render function
 def get_render_func(venv):
+    """ Returns the correct render function for a possibly vectorized environment. """
     if hasattr(venv, 'envs'):
         return venv.envs[0].render
     elif hasattr(venv, 'venv'):
@@ -49,6 +47,7 @@ def get_render_func(venv):
 
 
 def get_vec_normalize(venv):
+    """ Returns a vector normalized version of a (possibly) vectorised environment. """
     if isinstance(venv, VecNormalize):
         return venv
     elif hasattr(venv, 'venv'):
@@ -57,8 +56,9 @@ def get_vec_normalize(venv):
     return None
 
 
-# Necessary for my KFAC implementation.
+# Necessary for KFAC implementation.
 class AddBias(nn.Module):
+    """ Adds a bias offset to a tensor """
     def __init__(self, bias):
         super(AddBias, self).__init__()
         self._bias = nn.Parameter(bias.unsqueeze(1))
@@ -72,20 +72,8 @@ class AddBias(nn.Module):
         return x + bias
 
 
-def update_linear_schedule(optimizer, epoch, total_num_epochs, initial_lr):
-    """Decreases the learning rate linearly"""
-    lr = initial_lr - (initial_lr * (epoch / float(total_num_epochs)))
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-
-def init(module, weight_init, bias_init, gain=1):
-    weight_init(module.weight.data, gain=gain)
-    bias_init(module.bias.data)
-    return module
-
-
 def cleanup_log_dir(log_dir):
+    """ Removes log files from a log directory if it exists and creates it if not """
     try:
         os.makedirs(log_dir)
     except OSError:
@@ -94,3 +82,29 @@ def cleanup_log_dir(log_dir):
             os.remove(f)
 
 
+def cleanup_save_dir(save_dir):
+    """ Removes parameter save files from a save directory if it exists and creates it if not """
+    try:
+        os.makedirs(save_dir)
+    except OSError:
+        files = glob.glob(os.path.join(save_dir, '*.pt'))
+        for f in files:
+            os.remove(f)
+
+
+def get_args_string(args):
+    """
+    Creates a string summarising the argparse arguments.
+    :param args: parser.parse_args()
+
+    :return: String of the arguments of the argparse namespace.
+    """
+    string = ''
+    if hasattr(args, 'experiment_name'):
+        string += f'{args.experiment_name} ({datetime.now()})\n'
+    max_length = max([len(k) for k, _ in vars(args).items()])
+    new_dict = OrderedDict((k, v) for k, v in sorted(
+        vars(args).items(), key=lambda x: x[0]))
+    for key, value in new_dict.items():
+        string += ' ' * (max_length - len(key)) + key + ': ' + str(value) + '\n'
+    return string

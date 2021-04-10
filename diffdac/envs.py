@@ -1,9 +1,3 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-#
 """
 MIT License
 
@@ -30,10 +24,16 @@ SOFTWARE.
 Modified from https://github.com/ikostrikov/pytorch-a2c-ppo-acktr-gail
 """
 
+# Monkey patch baselines types dictionary to expand it as a quickfix
+import numpy as np
+from ctypes import c_double
+from baselines.common.vec_env.shmem_vec_env import _NP_TO_CT
+_NP_TO_CT[np.float64] = c_double
+
+
 import os
 
 import gym
-import numpy as np
 import torch
 from gym.spaces.box import Box
 
@@ -42,49 +42,55 @@ from baselines.common.atari_wrappers import make_atari, wrap_deepmind
 from baselines.common.vec_env import VecEnvWrapper
 from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
 from baselines.common.vec_env.shmem_vec_env import ShmemVecEnv
-from baselines.common.vec_env.vec_normalize import \
-    VecNormalize as VecNormalize_
+from baselines.common.vec_env.vec_normalize import VecNormalize as VecNormalize_
+
+from envs.register import register_custom_envs
+register_custom_envs()
 
 try:
     import dm_control2gym
 except ImportError:
     pass
 
-def make_env(env_id, seed, rank, log_dir, allow_early_resets, signature='',
-             max_steps=None):
+
+def make_env(env_id, seed, rank, log_dir, allow_early_resets, signature='', max_steps=None,
+             heterogeneous=False):
+    """ Returns function which sets up the required environment. """
     def _thunk():
-        if env_id.startswith("dm"):
-            _, domain, task = env_id.split('.')
-            env = dm_control2gym.make(domain_name=domain, task_name=task)
-        else:
-            env = gym.make(env_id)
+        env = gym.make(env_id)
+        # Copy the seed value to a version which may be updated to create log file names.
+        s = seed
 
-        is_atari = hasattr(gym.envs, 'atari') and isinstance(
-            env.unwrapped, gym.envs.atari.atari_env.AtariEnv)
-        if is_atari:
-            env = make_atari(env_id, max_steps)
-
-        env.seed(seed + rank)
-
-        obs_shape = env.observation_space.shape
+        # This if catches all the multi-task envs used in experiments
+        if 'mujoco' in env_id.lower() or env_id == 'RandomExtremeAcrobot-v1':
+            np.random.seed(seed + rank)
+            env.seed(seed + rank)
+            # Account for cases where environments are to be reset each episode using their own seed
+            # but where environment parameters (in the multi-task setting) are identical and where
+            # both initial state and environment parameter sampling are independent
+            # (i.e. where heterogeneous=True)
+            if heterogeneous:
+                env.sample_parameters(seed + rank)
+                s = seed + rank
+            else:
+                env.sample_parameters(seed)
+                s = seed
 
         if str(env.__class__.__name__).find('TimeLimit') >= 0:
             env = TimeLimitMask(env)
 
         if log_dir is not None:
+            # Set up logging with file names that also copture environment parameters where relevant
+            if 'mujoco' in env_id.lower():
+                to_add = f'Wind: {env.model.opt.wind}\tMass: {env.model.body_mass}'
+            elif env_id == "RandomExtremeAcrobot-v1":
+                to_add = f'm-{env.mass}-l-{env.length}-i-{env.inertia}'
+            else:
+                to_add = ''
             env = bench.Monitor(
                 env,
-                os.path.join(log_dir, str(rank) + signature),
+                os.path.join(log_dir, str(rank) + signature + f"seed-{s}" + to_add),
                 allow_early_resets=allow_early_resets)
-
-        if is_atari:
-            if len(env.observation_space.shape) == 3:
-                env = wrap_deepmind(env)
-        elif len(env.observation_space.shape) == 3:
-            raise NotImplementedError(
-                "CNN models work only for atari,\n"
-                "please use a custom wrapper for a custom pixel input env.\n"
-                "See wrap_deepmind for an example.")
 
         # If the input has shape (W,H,3), wrap for PyTorch convolutions
         obs_shape = env.observation_space.shape
@@ -98,16 +104,36 @@ def make_env(env_id, seed, rank, log_dir, allow_early_resets, signature='',
 
 def make_vec_envs(env_name, seed, num_processes, gamma, log_dir, device,
                   allow_early_resets, num_frame_stack=None, rank=0,
-                  signature='', max_steps=None):
-    print('log-dir', log_dir)
-    envs = [
-        make_env(env_name, seed, (rank * num_processes) + i, log_dir,
-                 allow_early_resets, signature, max_steps)
-        for i in range(num_processes)
-    ]
+                  signature='', max_steps=None, env_group_spec=None):
+    """ Make vectorised environments for parallelized experience sampling. """
+    # Should environments be the all the same for each learner or differ across processes for the
+    # same learner.
+    heterogeneous_envs = not (env_group_spec is not None and env_group_spec[1] == num_processes)
+    if env_group_spec is None or env_group_spec[0] == 1:
+        # No grouping of environment processes for each agent.
+        envs = [
+            make_env(env_name, seed + num_processes * rank, (rank * num_processes) + i,
+                     log_dir, allow_early_resets, signature, max_steps,
+                     heterogeneous=heterogeneous_envs)
+            for i in range(num_processes)
+        ]
+    else:
+        # We have environments grouped such that environments differ even for the same learner.
+        envs = []
+        counter = 0
+        for i in range(env_group_spec[0]):
+            envs += [
+                make_env(env_name, seed + num_processes * rank,
+                         (rank * num_processes) + counter + i, log_dir,
+                         allow_early_resets, signature, max_steps, heterogeneous=False)
+                for i in range(env_group_spec[1])
+            ]
+            seed += env_group_spec[1]
+            counter += env_group_spec[1]
 
+    # Allow dummy environment wrapper if no parallelisation required.
     if len(envs) > 1:
-        envs = ShmemVecEnv(envs)
+        envs = ShmemVecEnv(envs, context='fork')
     else:
         envs = DummyVecEnv(envs)
 
@@ -117,8 +143,10 @@ def make_vec_envs(env_name, seed, num_processes, gamma, log_dir, device,
         else:
             envs = VecNormalize(envs, gamma=gamma)
 
+    # Ensure environments are compatible with the PyTorch agents.
     envs = VecPyTorch(envs, device)
 
+    # Frame stacking for visual environments.
     if num_frame_stack is not None:
         envs = VecPyTorchFrameStack(envs, num_frame_stack, device)
     elif len(envs.observation_space.shape) == 3:
@@ -127,7 +155,7 @@ def make_vec_envs(env_name, seed, num_processes, gamma, log_dir, device,
     return envs
 
 
-# Checks whether done was caused my timit limits or not
+# Checks whether done was caused timit limits or not
 class TimeLimitMask(gym.Wrapper):
     def step(self, action):
         obs, rew, done, info = self.env.step(action)
@@ -140,14 +168,6 @@ class TimeLimitMask(gym.Wrapper):
         return self.env.reset(**kwargs)
 
 
-# Can be used to test recurrent policies for Reacher-v2
-class MaskGoal(gym.ObservationWrapper):
-    def observation(self, observation):
-        if self.env._elapsed_steps > 0:
-            observation[-2:0] = 0
-        return observation
-
-
 class TransposeObs(gym.ObservationWrapper):
     def __init__(self, env=None):
         """
@@ -156,28 +176,8 @@ class TransposeObs(gym.ObservationWrapper):
         super(TransposeObs, self).__init__(env)
 
 
-class TransposeImage(TransposeObs):
-    def __init__(self, env=None, op=[2, 0, 1]):
-        """
-        Transpose observation space for images
-        """
-        super(TransposeImage, self).__init__(env)
-        assert len(op) == 3, f"Error: Operation, {str(op)}, must be dim3"
-        self.op = op
-        obs_shape = self.observation_space.shape
-        self.observation_space = Box(
-            self.observation_space.low[0, 0, 0],
-            self.observation_space.high[0, 0, 0], [
-                obs_shape[self.op[0]], obs_shape[self.op[1]],
-                obs_shape[self.op[2]]
-            ],
-            dtype=self.observation_space.dtype)
-
-    def observation(self, ob):
-        return ob.transpose(self.op[0], self.op[1], self.op[2])
-
-
 class VecPyTorch(VecEnvWrapper):
+    """ Ensures vectorised environments are compatible with PyTorch agents """
     def __init__(self, venv, device):
         """Return only every `skip`-th frame"""
         super(VecPyTorch, self).__init__(venv)
@@ -204,6 +204,7 @@ class VecPyTorch(VecEnvWrapper):
 
 
 class VecNormalize(VecNormalize_):
+    """ Clips and normalises observation vectors. """
     def __init__(self, *args, **kwargs):
         super(VecNormalize, self).__init__(*args, **kwargs)
         self.training = True
@@ -225,47 +226,3 @@ class VecNormalize(VecNormalize_):
     def eval(self):
         self.training = False
 
-
-# Derived from
-# https://github.com/openai/baselines/blob/master/baselines/common/vec_env/vec_frame_stack.py
-class VecPyTorchFrameStack(VecEnvWrapper):
-    def __init__(self, venv, nstack, device=None):
-        self.venv = venv
-        self.nstack = nstack
-
-        wos = venv.observation_space  # wrapped ob space
-        self.shape_dim0 = wos.shape[0]
-
-        low = np.repeat(wos.low, self.nstack, axis=0)
-        high = np.repeat(wos.high, self.nstack, axis=0)
-
-        if device is None:
-            device = torch.device('cpu')
-        self.stacked_obs = torch.zeros((venv.num_envs, ) +
-                                       low.shape).to(device)
-
-        observation_space = gym.spaces.Box(
-            low=low, high=high, dtype=venv.observation_space.dtype)
-        VecEnvWrapper.__init__(self, venv, observation_space=observation_space)
-
-    def step_wait(self):
-        obs, rews, news, infos = self.venv.step_wait()
-        self.stacked_obs[:, :-self.shape_dim0] = \
-            self.stacked_obs[:, self.shape_dim0:]
-        for (i, new) in enumerate(news):
-            if new:
-                self.stacked_obs[i] = 0
-        self.stacked_obs[:, -self.shape_dim0:] = obs
-        return self.stacked_obs, rews, news, infos
-
-    def reset(self):
-        obs = self.venv.reset()
-        if torch.backends.cudnn.deterministic:
-            self.stacked_obs = torch.zeros(self.stacked_obs.shape)
-        else:
-            self.stacked_obs.zero_()
-        self.stacked_obs[:, -self.shape_dim0:] = obs
-        return self.stacked_obs
-
-    def close(self):
-        self.venv.close()
