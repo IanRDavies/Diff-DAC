@@ -7,6 +7,21 @@ Below we share the abstract from the paper to provide an overview:
 
 \[1\] Valcarcel Macua, S., Davies, I., Tukiainen, A., & De Cote, E. (2021). Fully distributed actor-critic architecture for multitask deep reinforcement learning. The Knowledge Engineering Review, 36, E6. doi:10.1017/S0269888921000023
 
+### Citing Diff-DAC
+If you use Diff-DAC in your work, please cite the [paper](https://www.cambridge.org/core/journals/knowledge-engineering-review/article/abs/fully-distributed-actorcritic-architecture-for-multitask-deep-reinforcement-learning/39535DB407F9556985B4D6BA9639465C) as below:
+```
+@article{
+    valcarcel macua_davies_tukiainen_de cote_2021, 
+    author={Valcarcel Macua, Sergio and Davies, Ian and Tukiainen, Aleksi and de Cote, Enrique Munoz}, 
+    title={Fully distributed actor-critic architecture for multitask deep reinforcement learning}, 
+    volume={36}, 
+    journal={The Knowledge Engineering Review}, 
+    publisher={Cambridge University Press}, 
+    year={2021}, 
+    pages={e6}
+}
+```
+
 ## Setup
 This code has been tested with
 * Python 3.7.4
