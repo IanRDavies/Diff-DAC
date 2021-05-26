@@ -1,8 +1,26 @@
 # Diff-DAC: Fully Distributed Actor-Critic Architecture for Multitask Deep Reinforcement Learning
-This repo contains the code used in developing the DiffDAC architecture for distributed multi-task reinforcement learning.
-Below we share the abstract from the paper by [Sergio Valcarcel Macua](https://github.com/sergiovalmac), [Ian Davies](https://github.com/IanRDavies), Aleksi Tukiainen and Enrique Munoz de Cote to provide an overview.
+This repo contains the code used in developing the DiffDAC architecture for distributed multi-task reinforcement learning as described in the paper by [Sergio Valcarcel Macua](https://github.com/sergiovalmac), [Ian Davies](https://github.com/IanRDavies), Aleksi Tukiainen and Enrique Munoz de Cote \[1\].
+
+Below we share the abstract from the paper to provide an overview:
 
 > We propose a fully distributed actor-critic architecture, named Diff-DAC, with application to multitask reinforcement learning (MRL). During the learning process, agents communicate their value and policy parameters to their neighbours, diffusing the information across a network of agents with no need for a central station. Each agent can only access data from its local task, but aims to learn a common policy that performs well for the whole set of tasks. The architecture is scalable, since the computational and communication cost per agent depends on the number of neighbours rather than the overall number of agents.We derive Diff-DAC from duality theory and provide novel insights into the actor-critic framework, showing that it is actually an instance of the dual ascent method.We prove almost sure convergence of Diff-DAC to a common policy under general assumptions that hold even for deep-neural network approximations. For more restrictive assumptions, we also prove that this common policy is a stationary point of an approximation of the original problem. Numerical results on multitask extensions of common continuous control benchmarks demonstrate that Diff-DAC stabilises learning and has a regularising effect that induces higher performance and better generalisation properties than previous architectures.
+
+\[1\] Valcarcel Macua, S., Davies, I., Tukiainen, A., & De Cote, E. (2021). Fully distributed actor-critic architecture for multitask deep reinforcement learning. The Knowledge Engineering Review, 36, E6. doi:10.1017/S0269888921000023
+
+### Citing Diff-DAC
+If you use Diff-DAC in your work, please cite the [paper](https://www.cambridge.org/core/journals/knowledge-engineering-review/article/abs/fully-distributed-actorcritic-architecture-for-multitask-deep-reinforcement-learning/39535DB407F9556985B4D6BA9639465C) as below:
+```
+@article{
+    valcarcel macua_davies_tukiainen_de cote_2021, 
+    author={Valcarcel Macua, Sergio and Davies, Ian and Tukiainen, Aleksi and de Cote, Enrique Munoz}, 
+    title={Fully distributed actor-critic architecture for multitask deep reinforcement learning}, 
+    volume={36}, 
+    journal={The Knowledge Engineering Review}, 
+    publisher={Cambridge University Press}, 
+    year={2021}, 
+    pages={e6}
+}
+```
 
 ## Setup
 This code has been tested with
